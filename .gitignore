@@ -1,0 +1,9 @@
+# 测试临时产物
+/tmp/
+*.log
+*.status_n
+.DS_Store
+
+# 运行时状态（实际在 ~/.local/state/mesh-spawn，不在仓库内；防御性忽略）
+state/
+*.lock/
