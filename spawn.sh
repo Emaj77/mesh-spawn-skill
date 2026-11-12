@@ -88,34 +88,74 @@ if [ -n "$on" ]; then
   fi
 fi
 
-resolve_abs() {
-  local base="$1" out
-  if [ -n "$on" ]; then
+# 远程命令不继承本地环境。路径经 base64 传入，避免空格、引号和 cmd 元字符被拆开。
+remote_b64() {
+  printf '%s' "$1" | "$PY" -c 'import base64,sys; print(base64.b64encode(sys.stdin.buffer.read()).decode("ascii"), end="")'
+}
+
+remote_sh_path() {
+  local target="$1" encoded="$2" script="$3" out rc
+  out=$(hc exec --on "$target" -- sh -c "b='$encoded'; $script" 2>/dev/null | tr -d '\r\n' | tail -1)
+  rc=$?
+  [ "$rc" -eq 0 ] && [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+}
+
+remote_cmd_path() {
+  local target="$1" encoded="$2" script="$3" out rc
+  out=$(hc exec --on "$target" -- cmd.exe /v:on /c "set \"MESH_SPAWN_PATH_B64=$encoded\" & $script" 2>/dev/null | tr -d '\r\n' | tail -1)
+  rc=$?
+  [ "$rc" -eq 0 ] && [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+}
+
+# 只探测已有目录，不创建。远程命令必须同时检查退出码，不能只看输出。
+probe_abs() {
+  local base="$1" target="${2:-$on}" encoded out
+  if [ -n "$target" ]; then
+    encoded=$(remote_b64 "$base")
     if [ "$remote_sh" = "1" ]; then
-      out=$(hc exec --on "$on" -- sh -c 'if [ -d "$1" ]; then cd "$1"; else mkdir -p "$1" && cd "$1"; fi && { pwd -W 2>/dev/null || pwd -P; }' _ "$base" 2>/dev/null | tr -d '\r\n' | tail -1)
-      if [ -n "$out" ]; then echo "$out"; return 0; fi
+      out=$(remote_sh_path "$target" "$encoded" 'p=$(printf %s "$b" | base64 -d) && [ -d "$p" ] && cd "$p" && { pwd -W 2>/dev/null || pwd -P; }' || true)
+      if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
     fi
-    out=$(hc exec --on "$on" -- cmd.exe /c "cd /d \"$base\" & cd" 2>/dev/null | tr -d '\r\n' | tail -1)
-    if [ -n "$out" ]; then echo "$out"; return 0; fi
+    out=$(remote_cmd_path "$target" "$encoded" 'for /f "delims=" %p in ('"'"'python -c "import base64,os; print(base64.b64decode(os.environ[\"MESH_SPAWN_PATH_B64\"]).decode())"'"'"') do if exist "%p\\" (cd /d "%p" && cd)' || true)
+    if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
     return 1
-  else
-    [ -d "$base" ] || mkdir -p "$base"
-    (cd "$base" && { pwd -W 2>/dev/null || pwd -P; })
   fi
+  [ -d "$base" ] || return 1
+  (cd "$base" && { pwd -W 2>/dev/null || pwd -P; })
+}
+
+# 仅在显式请求启动目录时创建；创建失败不能回退成另一个目录。
+ensure_abs() {
+  local base="$1" encoded out
+  out=$(probe_abs "$base" 2>/dev/null || true)
+  if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
+  if [ -n "$on" ]; then
+    encoded=$(remote_b64 "$base")
+    if [ "$remote_sh" = "1" ]; then
+      out=$(remote_sh_path "$on" "$encoded" 'p=$(printf %s "$b" | base64 -d) && mkdir -p "$p" && cd "$p" && { pwd -W 2>/dev/null || pwd -P; }' || true)
+      if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
+    fi
+    out=$(remote_cmd_path "$on" "$encoded" 'for /f "delims=" %p in ('"'"'python -c "import base64,os; print(base64.b64decode(os.environ[\"MESH_SPAWN_PATH_B64\"]).decode())"'"'"') do mkdir "%p" && cd /d "%p" && cd' || true)
+    if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
+    return 1
+  fi
+  mkdir -p "$base" || return 1
+  (cd "$base" && { pwd -W 2>/dev/null || pwd -P; })
 }
 
 # 只探测不创建：候选 space/终端的实际分组根。取不到返回空，绝不用前缀猜。
 probe_root() {
-  local base="$1" on="$2" out
+  local base="$1" on="$2" encoded out
   if [ -n "$on" ]; then
+    encoded=$(remote_b64 "$base")
     if [ "$remote_sh" = "1" ]; then
-      out=$(hc exec --on "$on" -- sh -c 'if [ -d "$1" ]; then cd "$1" && { git rev-parse --show-toplevel 2>/dev/null || pwd -W 2>/dev/null || pwd -P; }; fi' _ "$base" 2>/dev/null | tr -d '\r\n' | tail -1)
+      out=$(remote_sh_path "$on" "$encoded" 'p=$(printf %s "$b" | base64 -d) && [ -d "$p" ] && cd "$p" && { git rev-parse --show-toplevel 2>/dev/null || pwd -W 2>/dev/null || pwd -P; }' || true)
       if [ -n "$out" ]; then echo "$out"; return 0; fi
     fi
-    out=$(hc exec --on "$on" -- git -C "$base" rev-parse --show-toplevel 2>/dev/null | tr -d '\r\n' | tail -1)
-    if [ -n "$out" ]; then echo "$out"; return 0; fi
-    out=$(hc exec --on "$on" -- cmd.exe /c "cd /d \"$base\" & cd" 2>/dev/null | tr -d '\r\n' | tail -1)
-    if [ -n "$out" ]; then echo "$out"; return 0; fi
+    out=$(probe_abs "$base" "$on" 2>/dev/null || true)
+    if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
     return 1
   else
     [ -d "$base" ] || return 1
@@ -128,23 +168,25 @@ probe_root() {
 }
 
 resolve_root() {
-  local base="$1" out
+  local base="$1" encoded out
+  out=$(probe_root "$base" "$on" 2>/dev/null || true)
+  if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
   if [ -n "$on" ]; then
+    encoded=$(remote_b64 "$base")
     if [ "$remote_sh" = "1" ]; then
-      out=$(hc exec --on "$on" -- sh -c 'if [ -d "$1" ]; then cd "$1"; else mkdir -p "$1" && cd "$1"; fi && { git rev-parse --show-toplevel 2>/dev/null || pwd -W 2>/dev/null || pwd -P; }' _ "$base" 2>/dev/null | tr -d '\r\n' | tail -1)
-      if [ -n "$out" ]; then echo "$out"; return 0; fi
+      out=$(remote_sh_path "$on" "$encoded" 'p=$(printf %s "$b" | base64 -d) && mkdir -p "$p" && cd "$p" && { git rev-parse --show-toplevel 2>/dev/null || pwd -W 2>/dev/null || pwd -P; }' || true)
+      if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
     fi
-    out=$(hc exec --on "$on" -- git -C "$base" rev-parse --show-toplevel 2>/dev/null | tr -d '\r\n' | tail -1)
-    if [ -n "$out" ]; then echo "$out"; return 0; fi
-    resolve_abs "$base"
-  else
-    [ -d "$base" ] || mkdir -p "$base"
-    if command -v git >/dev/null 2>&1; then
-      out=$(cd "$base" && git rev-parse --show-toplevel 2>/dev/null || true)
-      if [ -n "$out" ]; then echo "$out"; return 0; fi
-    fi
-    (cd "$base" && { pwd -W 2>/dev/null || pwd -P; })
+    out=$(remote_cmd_path "$on" "$encoded" 'for /f "delims=" %p in ('"'"'python -c "import base64,os; print(base64.b64decode(os.environ[\"MESH_SPAWN_PATH_B64\"]).decode())"'"'"') do mkdir "%p" && cd /d "%p" && cd' || true)
+    if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
+    return 1
   fi
+  mkdir -p "$base" || return 1
+  if command -v git >/dev/null 2>&1; then
+    out=$(cd "$base" && git rev-parse --show-toplevel 2>/dev/null || true)
+    if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
+  fi
+  (cd "$base" && { pwd -W 2>/dev/null || pwd -P; })
 }
 
 # 启动目录与分组 root 分离：launch_cwd 是终端实际落脚处，root 只用于 space 分组。
@@ -162,11 +204,11 @@ case "$(uname -s 2>/dev/null || echo unknown)" in
   *) if [ -z "$on" ] && [[ "$cwd" =~ ^[A-Za-z]:[\\/] ]]; then die "Windows 路径只能用于 Windows 本机或 --on <机器>: $cwd"; fi;;
 esac
 
-root=$(resolve_root "$cwd")
+root=$(resolve_root "$cwd") || die "无法解析项目目录：$cwd"
 [ -n "$root" ] || die "无法解析项目目录：$cwd"
 [ "$root" = "/" ] || [[ "$root" =~ ^[A-Za-z]:/$ ]] || root=${root%/}
-launch_cwd=$(resolve_abs "$cwd" 2>/dev/null || true)
-[ -n "$launch_cwd" ] || launch_cwd="$root"
+launch_cwd=$(ensure_abs "$cwd") || die "无法准备启动目录：$cwd"
+[ -n "$launch_cwd" ] || die "无法准备启动目录：$cwd"
 
 # 稳定项目名：显式 --project 优先，否则取项目目录名。
 if [ -z "$project" ]; then
@@ -177,6 +219,32 @@ project=$(printf '%s' "$project" | tr -d '\r\n')
 
 # 并发防重复：同一控制机上把「查 space → 建 space/tab」串行化。
 rnd() { od -An -tx1 -N16 /dev/urandom | tr -d ' \n'; }
+lock_started_ms() {
+  "$PY" -c 'import time; print(int(time.time() * 1000))'
+}
+lock_owner_alive() {
+  local pid="$1" started="$2" line now
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ "$started" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  line=$(ps -p "$pid" -l 2>/dev/null | awk -v want="$pid" 'NR > 1 && $1 == want { print; exit }')
+  [ -n "$line" ] || return 1
+  now=$(lock_started_ms)
+  "$PY" -c 'import datetime, sys
+line, started, now = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+fields = line.split()
+if len(fields) < 7: raise SystemExit(1)
+try:
+    clock = datetime.datetime.strptime(fields[6], "%H:%M:%S").time()
+except ValueError:
+    raise SystemExit(1)
+current = datetime.datetime.fromtimestamp(now / 1000)
+owner = datetime.datetime.combine(current.date(), clock)
+if owner - current > datetime.timedelta(minutes=1):
+    owner -= datetime.timedelta(days=1)
+stamp = datetime.datetime.fromtimestamp(started / 1000)
+raise SystemExit(0 if abs(stamp - owner) <= datetime.timedelta(seconds=2) else 1)' "$line" "$started" "$now"
+}
 state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/mesh-spawn"
 mkdir -p "$state_dir"
 lock="$state_dir/spawn.lock"
@@ -185,7 +253,7 @@ release_lock() {
   if [ -n "$owner_token" ] && [ -d "$lock" ]; then
     local tok; tok=$(cat "$lock/token" 2>/dev/null || true)
     if [ "$tok" = "$owner_token" ]; then
-      rm -f "$lock/token" "$lock/pid" 2>/dev/null || true
+      rm -f "$lock/owner" "$lock/token" "$lock/pid" "$lock/started_ms" "$lock/owner.tmp" "$lock/meta.tmp" 2>/dev/null || true
       rmdir "$lock" 2>/dev/null || true
     fi
   fi
@@ -193,26 +261,85 @@ release_lock() {
 }
 acquire_lock() {
   local i=0 lp
+  local prepared_token started_now; prepared_token=$(rnd); started_now=$(lock_started_ms)
   while ! mkdir "$lock" 2>/dev/null; do
-    if [ -f "$lock/pid" ]; then
-      lp=$(cat "$lock/pid" 2>/dev/null || true)
-      if [ -n "$lp" ] && kill -0 "$lp" 2>/dev/null; then
-        # 进程仍在运行，等待
+    owner_now=""
+    if [ -s "$lock/owner" ]; then owner_now=$(cat "$lock/owner" 2>/dev/null || true); fi
+    started_now_file=""
+    if [ -f "$lock/started_ms" ]; then started_now_file=$(cat "$lock/started_ms" 2>/dev/null || true); fi
+    if [ -n "$owner_now" ]; then
+      pid_now=""
+      if [ -f "$lock/pid" ]; then pid_now=$(cat "$lock/pid" 2>/dev/null || true); fi
+      if [ -z "$pid_now" ] || [ -z "$started_now_file" ]; then
         i=$((i + 1))
-        [ "$i" -ge "${MESH_SPAWN_LOCK_TRIES:-600}" ] && die "BLOCKED: 等待 spawn 锁超时（${lock}），其他实例仍在运行"
+        [ "$i" -ge "${MESH_SPAWN_LOCK_INIT_TRIES:-50}" ] && die "BLOCKED: spawn 锁没有完整持有者信息（${lock}）。确认无 spawn 正在运行后，删除该目录再重试"
         sleep 0.1
         continue
       fi
+      if lock_owner_alive "$pid_now" "$started_now_file"; then
+        i=$((i + 1))
+        [ "$i" -ge "${MESH_SPAWN_LOCK_TRIES:-600}" ] && die "BLOCKED: 等待 spawn 锁超时（${lock}），PID ${pid_now} 仍在运行。确认无 spawn 正在运行后，删除该目录再重试"
+        sleep 0.1
+        continue
+      fi
+      die "BLOCKED: spawn 锁持有者 PID ${pid_now} 已失效（${lock}）。确认无 spawn 正在运行后，删除该目录再重试"
     fi
-    # 无 stale 回收：超时即失败
+    pid_now=""
+    if [ -f "$lock/pid" ]; then pid_now=$(cat "$lock/pid" 2>/dev/null || true); fi
+    if [ -n "$pid_now" ]; then
+      if lock_owner_alive "$pid_now" "$started_now_file"; then
+        # 进程仍在运行，等待
+        i=$((i + 1))
+        [ "$i" -ge "${MESH_SPAWN_LOCK_TRIES:-600}" ] && die "BLOCKED: 等待 spawn 锁超时（${lock}），PID ${pid_now} 仍在运行。确认无 spawn 正在运行后，删除该目录再重试"
+        sleep 0.1
+        continue
+      fi
+      die "BLOCKED: spawn 锁持有者 PID ${pid_now} 已失效（${lock}）。确认无 spawn 正在运行后，删除该目录再重试"
+    fi
+    if [ -f "$lock/meta.tmp" ]; then
+      i=$((i + 1))
+      [ "$i" -ge "${MESH_SPAWN_LOCK_INIT_TRIES:-50}" ] && die "BLOCKED: spawn 锁正在初始化（${lock}）。确认无 spawn 正在运行后，删除该目录再重试"
+      sleep 0.1
+      continue
+    fi
     i=$((i + 1))
-    [ "$i" -ge "${MESH_SPAWN_LOCK_TRIES:-600}" ] && die "BLOCKED: 等待 spawn 锁超时（${lock}）"
+    [ "$i" -ge "${MESH_SPAWN_LOCK_INIT_TRIES:-50}" ] && die "BLOCKED: spawn 锁没有有效持有者（${lock}）。确认无 spawn 正在运行后，删除该目录再重试"
     sleep 0.1
   done
-  # mkdir 成功后才写自己的 token 和 pid
-  owner_token=$(rnd)
-  echo "$owner_token" > "$lock/token"
-  echo $$ > "$lock/pid"
+  # token 在抢锁前生成，mkdir 成功后立即发布 owner。
+  owner_token="$prepared_token"
+  meta="$lock/meta.tmp"
+  {
+    printf 'owner=%s\n' "$owner_token"
+    printf 'token=%s\n' "$owner_token"
+    printf 'pid=%s\n' "$$"
+    printf 'started_ms=%s\n' "$started_now"
+  } > "$meta"
+  lock_py="$lock"
+  meta_py="$meta"
+  if command -v cygpath >/dev/null 2>&1; then
+    lock_py=$(cygpath -w "$lock")
+    meta_py=$(cygpath -w "$meta")
+  fi
+  "$PY" -c 'import os, sys
+lock, meta = sys.argv[1:]
+values = {}
+with open(meta, encoding="utf-8") as f:
+    for line in f:
+        key, value = line.rstrip("\n").split("=", 1)
+        values[key] = value
+for name in ("started_ms", "token", "pid"):
+    path = os.path.join(lock, name)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(values[name] + "\n")
+owner = os.path.join(lock, "owner")
+temporary = owner + ".tmp"
+with open(temporary, "w", encoding="utf-8", newline="\n") as f:
+    f.write(values["owner"] + "\n")
+    f.flush()
+    os.fsync(f.fileno())
+os.replace(temporary, owner)
+os.remove(meta)' "$lock_py" "$meta_py"
   trap release_lock EXIT
 }
 
@@ -227,14 +354,28 @@ if [ -n "$on" ]; then
     [ -n "${MESH_SPAWN_PROGRAM:-}" ] || [ -n "$claude_real" ] || die "BLOCKED: $on 上找不到 claude"
   fi
 else
-  if [ -x "$HOME/.local/bin/claude.exe" ]; then
-    claude_real=$(cygpath -w "$HOME/.local/bin/claude.exe")
-  else
-    claude_real=$(command -v claude 2>/dev/null || true)
-  fi
+  if [ -x "$HOME/.local/bin/claude.exe" ]; then claude_real="$HOME/.local/bin/claude.exe"
+  else claude_real=$(command -v claude 2>/dev/null || true); fi
   [ -n "${MESH_SPAWN_PROGRAM:-}" ] || [ -n "$claude_real" ] || die "找不到 claude"
 fi
+windows_launch_path() {
+  local p="$1" converted
+  case "$(uname -s 2>/dev/null || echo unknown)" in
+    MINGW*|MSYS*|CYGWIN*)
+      command -v cygpath >/dev/null 2>&1 || return 0
+      case "$p" in
+        [A-Za-z]:[\\/]*|[A-Za-z]:) return 0;;
+      esac
+      converted=$(cygpath -w "$p" 2>/dev/null | tr -d '\r' || true)
+      if [ -n "$converted" ]; then printf '%s\n' "$converted"; fi
+      ;;
+  esac
+}
 if [ -n "${MESH_SPAWN_PROGRAM:-}" ]; then claude="$MESH_SPAWN_PROGRAM"; else claude="$claude_real"; fi
+if [ -z "$on" ]; then
+  converted_claude=$(windows_launch_path "$claude" || true)
+  [ -n "$converted_claude" ] && claude="$converted_claude"
+fi
 case "$claude" in /*|[A-Za-z]:[\\/]*) ;; *) die "claude 启动路径不是绝对路径: $claude";; esac
 hcon=(); [ -n "$on" ] && hcon=(--on "$on")
 
@@ -250,9 +391,12 @@ route=""; addr=""; space=""; tab=""; gui_title_pending=false
 # route A 的 tab.new/space.new 直接给可见名，不存在覆盖问题；route B 在后段视 GUI 可达性重设。
 final_project="$project"; final_tab="$title"; reused=false
 
-if herdr-app status >/dev/null 2>&1; then
+acquire_lock
+use_route_a=0
+herdr-app status >/dev/null 2>&1 && use_route_a=1
+
+if [ "$use_route_a" = "1" ]; then
   # 路线 A：窗口开着，按「设备 + 项目根目录」找 space；找到就 tab.new，否则 space.new。
-  acquire_lock
   ls_json=$(herdr-app ls 2>/dev/null) || { release_lock; die "herdr-app ls 失败"; }
   # 候选 space 的分组根：优先可信 mesh.root 标签，缺失则解析其 folder 的实际 git 根/绝对目录。
   cand_tsv=$(printf '%s' "$ls_json" | "$PY" -c '
@@ -337,24 +481,40 @@ print(json.dumps(out, ensure_ascii=False))' "$on" "$root" "$project" "$title" "$
   if [ "$found" = "1" ]; then
     space=$(printf '%s' "$plan" | "$PY" -c 'import json,sys;print(json.load(sys.stdin).get("space",""))' | tr -d '\r')
     req=$("$PY" -c 'import json,sys;print(json.dumps({"space":sys.argv[1],"name":sys.argv[2],"folder":sys.argv[3],"argv":json.loads(sys.argv[4])},ensure_ascii=False))' "$space" "$final_tab" "$launch_cwd" "$argv_json")
-    out=$(herdr-app do tab.new "$req" 2>&1) || { release_lock; die "tab.new 失败: $out"; }
+    if out=$(herdr-app do tab.new "$req" 2>&1); then
+      route_a_ok=1
+    else
+      route_a_ok=0
+    fi
     reused=true
   else
     req=$("$PY" -c 'import json,sys;print(json.dumps({"name":sys.argv[1],"tab":sys.argv[2],"argv":json.loads(sys.argv[3]),"machine":sys.argv[4],"folder":sys.argv[5]},ensure_ascii=False))' "$final_project" "$final_tab" "$argv_json" "$on" "$launch_cwd")
-    out=$(herdr-app do space.new "$req" 2>&1) || { release_lock; die "space.new 失败: $out"; }
+    if out=$(herdr-app do space.new "$req" 2>&1); then
+      route_a_ok=1
+    else
+      route_a_ok=0
+    fi
   fi
-  route=app
-  read -r addr new_space tab < <(printf '%s' "$out" | "$PY" -c 'import json,sys
+  if [ "$route_a_ok" = "1" ]; then
+    route=app
+    read -r addr new_space tab < <(printf '%s' "$out" | "$PY" -c 'import json,sys
 d=json.load(sys.stdin)
 print(d.get("terminal",""),d.get("space",""),d.get("tab",""))' | tr -d '\r') || true
-  [ -n "$space" ] || space="$new_space"
-  release_lock
-  [ -n "$addr" ] || die "herdr-app 没返回 terminal: $out"
-  [ -n "$on" ] && [[ "$addr" != */* ]] && addr="$on/$addr"
-  hc label "$addr" "mesh=1" "mesh.name=$name" "mesh.project=$final_project" "mesh.root=$root" "where=$final_project / $final_tab" >/dev/null 2>&1 || true
+    [ -n "$space" ] || space="$new_space"
+    [ -n "$addr" ] || { release_lock; die "herdr-app 没返回 terminal: $out"; }
+    [ -n "$on" ] && [[ "$addr" != */* ]] && addr="$on/$addr"
+    hc label "$addr" "mesh=1" "mesh.name=$name" "mesh.project=$final_project" "mesh.root=$root" "where=$final_project / $final_tab" >/dev/null 2>&1 || true
+    release_lock
+  fi
 else
-  # 路线 B：窗口没开，先从 live 终端找回同项目的 space，再 hc run 起新 tab。
-  acquire_lock
+route_a_ok=0
+fi
+
+if [ "${route_a_ok:-0}" != "1" ]; then
+  # 路线 B：窗口没开或 Route A 在锁内失效，先从 live 终端找回同项目的 space，再 hc run 起新 tab。
+  if [ "$use_route_a" = "1" ]; then
+    reused=false; space=""; tab=""; final_project="$project"; final_tab="$title"
+  fi
   hc_ls=$(hc ls 2>/dev/null || true)
   cand_file="$state_dir/candidates.$$"
   match_file="$state_dir/matches.$$"
@@ -469,7 +629,9 @@ print(name)' "$space" "$title" < "$match_file" | tr -d '\r')
   addr=$(printf '%s' "$out" | "$PY" -c 'import json,sys;print(json.load(sys.stdin).get("address",""))' | tr -d '\r')
   [ -n "$addr" ] || { release_lock; die "hc run 没返回 address: $out"; }
   release_lock
+fi
 
+if [ "$route" = "hc" ]; then
   # GUI 认领 hc 终端时会用默认编号覆盖 tab 名：窗口可达则按 terminal 完整设备地址定位真实 tab，
   # tab.rename 修正后读回确认；space 名保持 GUI 自命名，不改（space 复用由 mesh.root 标签决定）。
   # 窗口不可达则 pending。
