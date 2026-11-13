@@ -34,6 +34,7 @@ description: 在某台设备的项目目录里开一个 herdr tab，起一个自
 - herdr-app 窗口开着：`herdr-app do space.new|tab.new`，立即出现在窗口里。
 - 窗口没开：`hc run --bg --keep --no-parent`，带 `herdr.space`/`herdr.tab` 标签；能从同项目的 live 终端（`mesh.root` 标签或 cwd 归属）找回 space 就复用，否则新建。
 - 同一控制机上并发 spawn 用锁串行化「查 space → 建 space/tab」。锁只清理本 owner 的 token/pid 文件和空目录；已有锁超时直接报错退出，不自动回收。
+- 空锁、失效 PID 和启动时间不匹配的复用 PID 会立即 `BLOCKED`。不要自动删除锁；确认没有 spawn 正在运行后，再删除 `~/.local/state/mesh-spawn/spawn.lock`。
 - argv 为 `claude "<task>" --channels <mesh 频道>`，频道参数运行时从本机 mesh 插件读取。
 - 不挂父终端，总控会话结束不会连带杀掉它。
 - 检测到首次进入目录的信任提示或 bypass 提示时，只读识别并返回 `needs_user_action`，保留会话等人工处理，不发送任何按键。
@@ -55,7 +56,7 @@ description: 在某台设备的项目目录里开一个 herdr tab，起一个自
 - Mac 上 claude 提示 `Channels are not currently available`（账号侧开关）：能用 mesh 工具发消息，但收不到推送；给它派活改用 `hc send <address> "<任务>"`。
 - 远程 `hc` 命令必须带 `MSYS_NO_PATHCONV=1`（脚本已设），否则 Git Bash 会把 `/Users/...` 改写成 Windows 路径。
 - 远端不假设有 sh：根目录探测先试 sh，再回退 `git -C` 与 `cmd.exe`；但定位 claude 必须有 sh，没有就明确 BLOCKED。
-- Windows 上 `command -v claude` 返回的 `/c/...` 会经 `cygpath -w` 转成 `C:\...` 再启动；输出 JSON 的 `claude` 字段是实际 argv[0]。
+- Windows 上本地 POSIX claude 路径会经 `cygpath -w` 转成 `C:\...` 再启动；输出 JSON 的 `claude` 字段保留定位到的原始路径。
 - 并发锁只在同一控制机内生效；两台控制机同时对同一目标机 spawn 同一项目时仍可能各建一个 space。
 - Route B 的 GUI 命名修复是「事后一次」：spawn 时窗口不可达则保持 pending，之后窗口打开不会再自动改；需要人工 `tab.rename` 或重新以 Route A spawn。
-- 锁持有者异常退出且未清理时，后续 spawn 会一直等到超时并报错；需人工确认后删除 `~/.local/state/mesh-spawn/spawn.lock`。
+- 锁持有者已失效时会立即报错并保留锁；需人工确认后删除 `~/.local/state/mesh-spawn/spawn.lock`。

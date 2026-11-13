@@ -72,7 +72,7 @@ MESH_SPAWN_GUI_ON=gui-host bash ~/.claude/skills/mesh-spawn/spawn.sh \
 - **Route B 的 GUI 命名修复**：spawn 后窗口可达则按 terminal 完整设备地址在 GUI 的 `herdr-app ls` 里定位真实 tab，`tab.rename` 修正被 GUI 用编号覆盖的名字并读回确认；space 名保持 GUI 自命名（space 复用由 `mesh.root` 标签决定）。窗口不可达 → `gui_title_pending=true`，不会假装命名。
 **跨机 GUI**：`MESH_SPAWN_GUI_ON=<机器>` 指定运行 herdr 窗口的机器，经 `hc exec --on <机器> -- herdr-app ...` 调用。终端地址按三方身份（控制机/目标机/GUI 机）规范为 GUI 视角的完整设备地址：GUI=目标机时无前缀（`t<id>`），否则为 GUI 机 `hc machine ls` 中目标机的 `name` 前缀（`<name>/t<id>`）。解析不到前缀 → `gui_title_pending=true`，不误匹配。
 - **并发**：同一控制机上「查 space → 建 space/tab」用带 owner token 的锁串行化；超时 `BLOCKED` 并保留锁，不自动回收、不 `rm -rf`。
-- **claude 定位**：远端必须有 sh（没有就明确 `BLOCKED`）；Windows Git Bash 的 `/c/...` 经 `cygpath -w` 转成 `C:\...`；argv[0] 必须绝对路径。`MESH_SPAWN_PROGRAM` 可覆盖为任意无 LLM 程序做验证。
+- **claude 定位**：远端必须有 sh（没有就明确 `BLOCKED`）；本地 MSYS/Git Bash 的 POSIX 路径统一经 `cygpath -w` 转成 `C:\...`；argv[0] 必须绝对路径。`MESH_SPAWN_PROGRAM` 可覆盖为任意无 LLM 程序做验证。
 - **信任/bypass 提示**：只读检测，输出 `needs_user_action`，保留会话等人工处理，不发送任何按键。
 - **不挂父终端**：总控会话结束不会连带杀掉它。
 
@@ -100,7 +100,7 @@ rm -rf ~/.claude/skills/mesh-spawn
 - 远程 `hc` 命令必须带 `MSYS_NO_PATHCONV=1`（脚本已设），否则 Git Bash 会把 `/Users/...` 改写成 Windows 路径。
 - 远端根目录探测先试 sh，再回退 `git -C` 与 `cmd.exe`；**但定位 claude 必须有 sh**，没有就明确 BLOCKED。
 - 并发锁只在同一控制机内生效；两台控制机同时对同一目标机 spawn 同一项目时仍可能各建一个 space。
-- 锁持有者异常退出且未清理时，后续 spawn 会一直等到超时并报 `BLOCKED`；需人工确认后删除 `~/.local/state/mesh-spawn/spawn.lock`。
+- 空锁、失效 PID 或 PID 已被其他进程复用时会立即 `BLOCKED`，不会自动删除锁；需确认没有 spawn 正在运行后删除 `~/.local/state/mesh-spawn/spawn.lock`。
 - Route B 的 GUI 命名修复是「事后一次」：spawn 时窗口不可达则保持 pending，之后窗口打开不会再自动改；需要人工 `tab.rename` 或重新以 Route A spawn。
 - 子代理（agent 里再 `hc run` 的终端）不属于本工具管理范围。
 
@@ -110,7 +110,7 @@ rm -rf ~/.claude/skills/mesh-spawn
 bash test.sh
 ```
 
-18 个场景（包含跨机 GUI 地址解析失败时保持 pending）：同项目复用 + tab 序号、不同项目独立、同名不同路径独立、远端别名归一、并发防重复、中文空格路径、live 终端找回、git 子目录共 space、锁四项（首清/二次/不覆盖/超时不改内容）、信任提示只读、worktree 独立、嵌套 repo 独立、无 git 父子独立、Route B 旧终端无 `mesh.root` 不并入、**Route B + GUI 可达时按 terminal 定位 tab 并 rename 读回**、**Route B + GUI 不可达时明确 pending**、Route A 命名不受影响。
+24 个场景（包含跨机 GUI 地址解析失败时保持 pending）：同项目复用 + tab 序号、不同项目独立、同名不同路径独立、远端别名归一、并发防重复、中文空格路径、live 终端找回、git 子目录共 space、锁四项（首清/二次/不覆盖/超时不改内容）、信任与 bypass 提示只读、worktree 独立、嵌套 repo 独立、无 git 父子独立、Route B 旧终端无 `mesh.root` 不并入、**Route B + GUI 可达时按 terminal 定位 tab 并 rename 读回**、**Route B + GUI 不可达时明确 pending**、Route A 命名不受影响、缺失远程路径、Route A 回退、失效锁、跨机 GUI 命令路由、无 `sh` 路径传参，以及 Windows 上的本地路径转换。
 
 ## 变更日志
 

@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- 远程路径探测与目录创建分离，路径经 base64 传入远程命令并检查退出码；缺失路径失败，不再回退到无关目录。
+- 本地 MSYS/Git Bash 的 POSIX claude 路径统一经 `cygpath -w` 转换为 Windows 路径。
+- Route A 在 spawn 锁内判定；GUI 创建失败时回退 Route B，不留下半成品。
+- 空锁、失效 PID 和 PID 被复用时立即 `BLOCKED`；只有 PID 与锁创建时间匹配的活进程才等待。
+- 跨机 GUI 命令明确发往 `MESH_SPAWN_GUI_ON`，并在该机器上读取机器列表。
+
+### Added
+- 覆盖 bypass 提示、缺失远程路径、Route A 回退、失效锁、无 `sh` 远程路径和本地 Windows 路径转换的测试。
+
 ## [0.2.0] - 2026-11-07
 
 ### Fixed
